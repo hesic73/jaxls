@@ -6,6 +6,7 @@ if TYPE_CHECKING or sys.version_info >= (3, 12):
     from ._core import AnalyzedLeastSquaresProblem as AnalyzedLeastSquaresProblem
     from ._core import Cost as Cost
     from ._core import LeastSquaresProblem as LeastSquaresProblem
+    from ._core import AuxiliaryData as AuxiliaryData
     from ._lie_group_variables import SE2Var as SE2Var
     from ._lie_group_variables import SE3Var as SE3Var
     from ._lie_group_variables import SO2Var as SO2Var
@@ -21,6 +22,7 @@ elif sys.version_info >= (3, 10):
     from ._py310._core import AnalyzedLeastSquaresProblem as AnalyzedLeastSquaresProblem
     from ._py310._core import Cost as Cost
     from ._py310._core import LeastSquaresProblem as LeastSquaresProblem
+    from ._py310._core import AuxiliaryData as AuxiliaryData
     from ._py310._lie_group_variables import SE2Var as SE2Var
     from ._py310._lie_group_variables import SE3Var as SE3Var
     from ._py310._lie_group_variables import SO2Var as SO2Var

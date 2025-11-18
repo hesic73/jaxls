@@ -11,6 +11,8 @@ from typing import (
     Literal,
     cast,
     overload,
+    TypeVar,
+    Generic,
 )
 
 import jax
@@ -37,35 +39,64 @@ from ._sparse_matrices import (
 from ._variables import Var, VarTypeOrdering, VarValues, sort_and_stack_vars
 
 
+T = TypeVar("T")
+
+
+@jdc.pytree_dataclass
+class AuxiliaryData(Generic[T]):
+    """Marker for auxiliary data that should not affect JIT compilation cache.
+    Auxiliary data is traced (participates in computation) but doesn't affect
+    whether we recompile the kernel.
+    Args:
+        key: Key for lookup in auxiliary_data dict
+        shape_dtype: Shape and dtype spec for validation
+    """
+
+    key: jdc.Static[str]
+    shape_dtype: jdc.Static[jax.ShapeDtypeStruct]
+
+
 def _get_function_signature(func: Callable) -> Hashable:
-    """Returns a hashable value, which should be equal for equivalent input functions."""
+    """Returns a hashable value, which should be equal for equivalent input functions.
+    Auxiliary data in closures is excluded from the signature to enable kernel reuse.
+    """
     closure = getattr(func, "__closure__", None)
     if closure is not None:
-        closure_vars = tuple(sorted((str(cell.cell_contents) for cell in closure)))
+        closure_vars = []
+        for cell in closure:
+            val = cell.cell_contents
+            # Skip auxiliary data dictionaries (they change between solves)
+            if isinstance(val, dict) and all(
+                isinstance(k, str) and isinstance(v, (jax.Array, jnp.ndarray))
+                for k, v in val.items()
+            ):
+                # Likely an auxiliary_data dict, use structure only
+                closure_vars.append(f"<aux_dict:{tuple(sorted(val.keys()))}>")
+            else:
+                closure_vars.append(str(val))
+        closure_vars = tuple(sorted(closure_vars))
     else:
         closure_vars = ()
 
     instance = getattr(func, "__self__", None)
-    if instance is not None:
-        instance_id = id(instance)
-    else:
-        instance_id = None
+    instance_id = id(instance) if instance is not None else None
 
     bytecode = dis.Bytecode(func)
     bytecode_tuple = tuple((instr.opname, instr.argrepr) for instr in bytecode)
+
     return bytecode_tuple, closure_vars, instance_id
 
 
 @jdc.pytree_dataclass
 class LeastSquaresProblem:
     """We define least squares problem as bipartite graphs, which have two types of nodes:
-
     - `jaxls.Cost`. These are the terms we want to minimize.
     - `jaxls.Var`. These are the parameters we want to optimize.
     """
 
     costs: Iterable[Cost]
     variables: Iterable[Var]
+    auxiliary_spec: jdc.Static[dict[str, jax.ShapeDtypeStruct] | None] = None  # new field
 
     def analyze(self, use_onp: bool = False) -> AnalyzedLeastSquaresProblem:
         """Analyze sparsity pattern of least squares problem. Needed before solving."""
@@ -180,6 +211,26 @@ class LeastSquaresProblem:
         sorted_ids_from_var_type = sort_and_stack_vars(variables)
         del variables
 
+        # Collect all auxiliary keys from costs
+        all_aux_keys = set()
+        for cost in costs:
+            all_aux_keys.update(cost.auxiliary_keys)
+            if cost.auxiliary_kwarg_keys:
+                all_aux_keys.update(cost.auxiliary_kwarg_keys.values())
+
+        # Validate auxiliary_spec covers all keys
+        if all_aux_keys:
+            if self.auxiliary_spec is None:
+                raise ValueError(
+                    f"Costs use auxiliary data {all_aux_keys} but "
+                    f"auxiliary_spec is not provided"
+                )
+            missing = all_aux_keys - set(self.auxiliary_spec.keys())
+            if missing:
+                raise ValueError(
+                    f"Auxiliary keys {missing} used in costs but not in auxiliary_spec"
+                )
+
         # Prepare each cost group. We put groups in a consistent order.
         residual_dim_sum = 0
         for group_key in sorted(costs_from_group.keys(), key=_sort_key):
@@ -189,9 +240,9 @@ class LeastSquaresProblem:
             stacked_cost: Cost = jax.tree.map(
                 lambda *args: jnp.concatenate(args, axis=0), *group
             )
-            stacked_cost_expanded: _AnalyzedCost = jax.vmap(_AnalyzedCost._make)(
-                stacked_cost
-            )
+            stacked_cost_expanded: _AnalyzedCost = jax.vmap(
+                functools.partial(_AnalyzedCost._make, auxiliary_spec=self.auxiliary_spec)
+            )(stacked_cost)
             stacked_costs.append(stacked_cost_expanded)
             cost_counts.append(count_from_group[group_key])
 
@@ -255,6 +306,7 @@ class LeastSquaresProblem:
             tangent_start_from_var_type=tangent_start_from_var_type,
             tangent_dim=tangent_dim_sum,
             residual_dim=residual_dim_sum,
+            auxiliary_spec=self.auxiliary_spec,
         )
 
 
@@ -269,12 +321,14 @@ class AnalyzedLeastSquaresProblem:
     tangent_start_from_var_type: jdc.Static[dict[type[Var[Any]], int]]
     tangent_dim: jdc.Static[int]
     residual_dim: jdc.Static[int]
+    auxiliary_spec: jdc.Static[dict[str, jax.ShapeDtypeStruct] | None] = None  # new field
 
     @overload
     def solve(
         self,
         initial_vals: VarValues | None = None,
-        *,
+        *, 
+        auxiliary_data: dict[str, jax.Array] | None = None,  # new parameter
         linear_solver: Literal["conjugate_gradient", "cholmod", "dense_cholesky"]
         | ConjugateGradientConfig = "conjugate_gradient",
         trust_region: TrustRegionConfig | None = TrustRegionConfig(),
@@ -288,7 +342,8 @@ class AnalyzedLeastSquaresProblem:
     def solve(
         self,
         initial_vals: VarValues | None = None,
-        *,
+        *, 
+        auxiliary_data: dict[str, jax.Array] | None = None,  # new parameter
         linear_solver: Literal["conjugate_gradient", "cholmod", "dense_cholesky"]
         | ConjugateGradientConfig = "conjugate_gradient",
         trust_region: TrustRegionConfig | None = TrustRegionConfig(),
@@ -301,7 +356,8 @@ class AnalyzedLeastSquaresProblem:
     def solve(
         self,
         initial_vals: VarValues | None = None,
-        *,
+        *, 
+        auxiliary_data: dict[str, jax.Array] | None = None,  # new parameter
         linear_solver: Literal["conjugate_gradient", "cholmod", "dense_cholesky"]
         | ConjugateGradientConfig = "conjugate_gradient",
         trust_region: TrustRegionConfig | None = TrustRegionConfig(),
@@ -312,9 +368,9 @@ class AnalyzedLeastSquaresProblem:
     ) -> VarValues | tuple[VarValues, SolveSummary]:
         """Solve the nonlinear least squares problem using either Gauss-Newton
         or Levenberg-Marquardt.
-
         Args:
             initial_vals: Initial values for the variables. If None, default values will be used.
+            auxiliary_data: Dictionary of values for auxiliary data.
             linear_solver: The linear solver to use.
             trust_region: Configuration for Levenberg-Marquardt trust region.
             termination: Configuration for termination criteria.
@@ -322,10 +378,37 @@ class AnalyzedLeastSquaresProblem:
                 multiplication. Can be "blockrow", "coo", or "csr".
             verbose: Whether to print verbose output during optimization.
             return_summary: If `True`, return a summary of the solve.
-
         Returns:
             Optimized variable values.
         """
+        # Validate auxiliary_data
+        if self.auxiliary_spec is not None:
+            if auxiliary_data is None:
+                raise ValueError(
+                    f"Problem requires auxiliary_data with keys {list(self.auxiliary_spec.keys())}"
+                )
+
+            # Check all required keys present
+            missing = set(self.auxiliary_spec.keys()) - set(auxiliary_data.keys())
+            if missing:
+                raise ValueError(f"Missing auxiliary data keys: {missing}")
+
+            # Validate shape and dtype
+            for key, spec in self.auxiliary_spec.items():
+                actual = auxiliary_data[key]
+                if actual.shape != spec.shape:
+                    raise ValueError(
+                        f"Auxiliary data '{key}' shape mismatch: "
+                        f"expected {spec.shape}, got {actual.shape}"
+                    )
+                if actual.dtype != spec.dtype:
+                    raise ValueError(
+                        f"Auxiliary data '{key}' dtype mismatch: "
+                        f"expected {spec.dtype}, got {actual.dtype}"
+                    )
+        elif auxiliary_data is not None:
+            raise ValueError("auxiliary_data provided but problem doesn't use auxiliary data")
+
         if initial_vals is None:
             initial_vals = VarValues.make(
                 var_type(ids) for var_type, ids in self.sorted_ids_from_var_type.items()
@@ -349,21 +432,33 @@ class AnalyzedLeastSquaresProblem:
             verbose,
         )
         return solver.solve(
-            problem=self, initial_vals=initial_vals, return_summary=return_summary
+            problem=self, initial_vals=initial_vals, auxiliary_data=auxiliary_data, return_summary=return_summary
         )
 
     @overload
     def compute_residual_vector(
-        self, vals: VarValues, include_jac_cache: Literal[True]
+        self,
+        vals: VarValues,
+        *, 
+        auxiliary_data: dict[str, jax.Array] | None = None,
+        include_jac_cache: Literal[True],
     ) -> tuple[jax.Array, CustomJacobianCache]: ...
 
     @overload
     def compute_residual_vector(
-        self, vals: VarValues, include_jac_cache: Literal[False] = False
+        self,
+        vals: VarValues,
+        *, 
+        auxiliary_data: dict[str, jax.Array] | None = None,
+        include_jac_cache: Literal[False] = False,
     ) -> jax.Array | tuple[jax.Array, tuple[CustomJacobianCache, ...]]: ...
 
     def compute_residual_vector(
-        self, vals: VarValues, include_jac_cache: bool = False
+        self,
+        vals: VarValues,
+        *, 
+        auxiliary_data: dict[str, jax.Array] | None = None,
+        include_jac_cache: bool = False,
     ) -> jax.Array | tuple[jax.Array, tuple[CustomJacobianCache, ...]]:
         """Compute the residual vector. The cost we are optimizing is defined
         as the sum of squared terms within this vector."""
@@ -372,7 +467,9 @@ class AnalyzedLeastSquaresProblem:
         for stacked_cost in self.stacked_costs:
             # Flatten the output of the user-provided compute_residual.
             compute_residual_out = jax.vmap(
-                lambda args: stacked_cost.compute_residual_flat(vals, *args)
+                lambda args: stacked_cost.compute_residual_flat(
+                    vals, *args, auxiliary_data=auxiliary_data if auxiliary_data else {}
+                )
             )(stacked_cost.args)
 
             if isinstance(compute_residual_out, tuple):
@@ -390,7 +487,7 @@ class AnalyzedLeastSquaresProblem:
             return jnp.concatenate(residual_slices, axis=0)
 
     def _compute_jac_values(
-        self, vals: VarValues, jac_cache: tuple[CustomJacobianCache, ...]
+        self, vals: VarValues, jac_cache: tuple[CustomJacobianCache, ...], auxiliary_data: dict[str, jax.Array] | None = None
     ) -> BlockRowSparseMatrix:
         block_rows = list[SparseBlockRow]()
         residual_offset = 0
@@ -434,6 +531,7 @@ class AnalyzedLeastSquaresProblem:
                     lambda tangent: cost.compute_residual_flat(
                         val_subset._retract(tangent, self.tangent_ordering),
                         *cost.args,
+                        auxiliary_data=auxiliary_data if auxiliary_data else {}
                     )
                 )(jnp.zeros((val_subset._get_tangent_dim(),)))
 
@@ -536,37 +634,28 @@ type CostFactory[**Args] = Callable[
 class Cost[*Args]:
     """A least squares cost term in our optimization problem, defined by a
     residual function.
-
     The recommended way to create a cost is to use the `create_factory` decorator
     on a function that computes the residual. This will transform the input function
     into a "factory" functinos that returns `Cost` objects.
-
-
     ```python
     @jaxls.Cost.create_factory
     def compute_residual(values: VarValues, [...args]) -> jax.Array:
         # Compute residual vector/array.
         return residual
-
     # `compute_residual()` is now a factory function that returns `jaxls.Cost` objects.
     problem = jaxls.LeastSquaresProblem(
         costs=[compute_residual(...), ...],
         variables=[...],
     )
     ```
-
     The cost that this represents is defined as:
-
          || compute_residual(values, *args) ||_2^2
-
     where `values` is a `jaxls.VarValues` object.
-
     Each `Cost.compute_residual` should take at least one argument that inherits
     from the symbolic variable `jaxls.Var(id)`, where `id` must be a scalar
     integer.
-
     To create a batch of costs, a leading batch axis can be added to the
-    arguments passed to `Cost.args`:
+    arguments passed to `Cost.args`: 
     - The batch axis must be the same for all arguments. Leading axes of shape
       `(1,)` are broadcasted.
     - The `id` field of each `jaxls.Var` instance must have shape of either
@@ -580,18 +669,19 @@ class Cost[*Args]:
     """Residual computation function. Can either return:
         1. A residual vector, or
         2. A tuple, where the tuple values should be (residual, jacobian_cache).
-
     The second option is useful when custom Jacobian computation benefits from
     intermediate values computed during the residual computation.
-
     `jac_custom_with_cache_fn` should be specified in the second case,
-    and will be expected to take arguments in the form `(values,
+    and will be expected to take arguments in the form `(values, 
     jacobian_cache, *args)`."""
 
     args: tuple[*Args]
     """Arguments to the residual function. This should include at least one
     `jaxls.Var` object, which can either in the root of the tuple or nested
     within a PyTree structure arbitrarily."""
+
+    auxiliary_keys: jdc.Static[tuple[str, ...]] = ()
+    auxiliary_kwarg_keys: jdc.Static[dict[str, str] | None] = None  # new field
 
     jac_mode: jdc.Static[Literal["auto", "forward", "reverse"]] = "auto"
     """Depending on the function being differentiated, it may be faster to use
@@ -601,7 +691,6 @@ class Cost[*Args]:
     jac_batch_size: jdc.Static[int | None] = None
     """Batch size for computing Jacobians that can be parallelized. Can be set
     to make tradeoffs between runtime and memory usage.
-
     If None, we compute all Jacobians in parallel. If 1, we compute Jacobians
     one at a time."""
 
@@ -630,7 +719,7 @@ class Cost[*Args]:
     # Simple decorator.
     @overload
     @staticmethod
-    def create_factory[**Args_](
+    def create_factory[**Args_]( 
         compute_residual: ResidualFunc[Args_],
     ) -> CostFactory[Args_]: ...
 
@@ -638,7 +727,7 @@ class Cost[*Args]:
     @overload
     @staticmethod
     def create_factory[**Args_](
-        *,
+        *, 
         jac_mode: Literal["auto", "forward", "reverse"] = "auto",
         jac_batch_size: int | None = None,
         name: str | None = None,
@@ -649,7 +738,7 @@ class Cost[*Args]:
     @overload
     @staticmethod
     def create_factory[**Args_](
-        *,
+        *, 
         jac_custom_fn: JacobianFunc[Args_],
         jac_batch_size: int | None = None,
         name: str | None = None,
@@ -660,7 +749,7 @@ class Cost[*Args]:
     @overload
     @staticmethod
     def create_factory[**Args_, TJacobianCache](
-        *,
+        *, 
         jac_custom_with_cache_fn: JacobianFuncWithCache[Args_, TJacobianCache],
         jac_batch_size: int | None = None,
         name: str | None = None,
@@ -671,7 +760,7 @@ class Cost[*Args]:
     @staticmethod
     def create_factory[**Args_](
         compute_residual: ResidualFunc[Args_] | None = None,
-        *,
+        *, 
         jac_mode: Literal["auto", "forward", "reverse"] = "auto",
         jac_batch_size: int | None = None,
         jac_custom_fn: JacobianFunc[Args_] | None = None,
@@ -683,29 +772,22 @@ class Cost[*Args]:
         | CostFactory[Args_]
     ):
         """Decorator for creating costs from a residual function.
-
         Examples:
-
             @jaxls.Cost.create_factory
             def cost1(values: VarValues, var1: SE2Var, var2: int) -> jax.Array:
                 ...
-
             # Factory will have the same input signature as the wrapped
             # residual function, but without the `VarValues` argument. The
             # return type will be `Factor` instead of `jax.Array`.
             cost = cost1(var1=SE2Var(0), var2=5)
             assert isinstance(cost, jaxls.Cost)
-
         Keyword arguments can also be used for configuration. For example:
-
             # To enforce forward-mode autodiff for Jacobians.
             @Factor.create_factory(jac_mode="forward")
             def cost(...): ...
-
             # To reduce memory usage.
             @Factor.create_factory(jac_batch_size=1)
             def cost(...): ...
-
         """
 
         def decorator(
@@ -714,11 +796,57 @@ class Cost[*Args]:
             def inner(
                 *args: Args_.args, **kwargs: Args_.kwargs
             ) -> Cost[tuple[Any, ...], dict[str, Any]]:
+                # Separate auxiliary args from regular args
+                def _split_args(args, kwargs):
+                    """Separate auxiliary data markers from regular arguments."""
+                    aux_keys = []
+                    regular_args = []
+                    aux_indices = []  # Track where auxiliary args were
+
+                    for i, arg in enumerate(args):
+                        if isinstance(arg, AuxiliaryData):
+                            aux_keys.append(arg.key)
+                            aux_indices.append(i)
+                        else:
+                            regular_args.append(arg)
+
+                    # Similarly handle kwargs
+                    aux_kwarg_keys = {}
+                    regular_kwargs = {}
+                    for key, value in kwargs.items():
+                        if isinstance(value, AuxiliaryData):
+                            aux_kwarg_keys[key] = value.key
+                        else:
+                            regular_kwargs[key] = value
+
+                    return tuple(aux_keys), tuple(regular_args), regular_kwargs, tuple(aux_indices), aux_kwarg_keys
+
+                aux_keys, regular_args, regular_kwargs, aux_indices, aux_kwarg_keys = _split_args(args, kwargs)
+
+                # Create wrapper that doesn't capture auxiliary data values
+                def _make_compute_with_aux(compute_residual_fn, aux_indices, aux_keys, aux_kwarg_keys):
+                    """Create wrapper that reconstructs args with auxiliary data at runtime."""
+
+                    def _compute_with_aux(values, regular_args, regular_kwargs, aux_data_dict):
+                        # Reconstruct full args by inserting auxiliary data at correct positions
+                        full_args = list(regular_args)
+                        for idx, key in zip(aux_indices, aux_keys):
+                            full_args.insert(idx, aux_data_dict[key])
+
+                        # Reconstruct kwargs
+                        full_kwargs = dict(regular_kwargs)
+                        for kwarg_name, aux_key in aux_kwarg_keys.items():
+                            full_kwargs[kwarg_name] = aux_data_dict[aux_key]
+
+                        return compute_residual_fn(values, *full_args, **full_kwargs)
+
+                    return _compute_with_aux
+
                 return Cost(
-                    compute_residual=lambda values, args, kwargs: compute_residual(
-                        values, *args, **kwargs
-                    ),
-                    args=(args, kwargs),
+                    compute_residual=_make_compute_with_aux(compute_residual, aux_indices, aux_keys, aux_kwarg_keys),
+                    args=(regular_args, regular_kwargs),
+                    auxiliary_keys=aux_keys,
+                    auxiliary_kwarg_keys=aux_kwarg_keys if aux_kwarg_keys else None,
                     jac_mode=jac_mode,
                     jac_batch_size=jac_batch_size,
                     jac_custom_fn=(
@@ -821,9 +949,21 @@ class _AnalyzedCost[*Args](Cost[*Args]):
     residual_flat_dim: jdc.Static[int] = 0
 
     def compute_residual_flat(
-        self, vals: VarValues, *args: *Args
+        self,
+        vals: VarValues,
+        *args: *Args,
+        auxiliary_data: dict[str, jax.Array],
     ) -> jax.Array | tuple[jax.Array, CustomJacobianCache]:
-        out = self.compute_residual(vals, *args)
+        # Unpack args
+        regular_args, regular_kwargs = args
+
+        # Call the wrapped compute_residual with auxiliary_data
+        out = self.compute_residual(
+            vals,
+            regular_args,
+            regular_kwargs,
+            auxiliary_data
+        )
 
         # Flatten residual vector.
         if isinstance(out, tuple):
@@ -836,7 +976,7 @@ class _AnalyzedCost[*Args](Cost[*Args]):
 
     @staticmethod
     @jdc.jit
-    def _make[*Args_](cost: Cost[*Args_]) -> _AnalyzedCost[*Args_]:
+    def _make[*Args_](cost: Cost[*Args_], auxiliary_spec: dict[str, jax.ShapeDtypeStruct] | None = None) -> _AnalyzedCost[*Args_]:
         """Construct a cost for our optimization problem."""
         variables = cost._get_variables()
         assert len(variables) > 0
@@ -850,11 +990,11 @@ class _AnalyzedCost[*Args](Cost[*Args]):
                     () if isinstance(var.id, int) else var.id.shape
                 ) == batch_axes, "Batch axes of variables do not match."
             if len(batch_axes) == 1:
-                return jax.vmap(_AnalyzedCost._make)(cost)
+                return jax.vmap(functools.partial(_AnalyzedCost._make, auxiliary_spec=auxiliary_spec))(cost)
 
         # Same as `compute_residual`, but removes Jacobian cache if present.
-        def _residual_no_cache(*args, **kwargs) -> jax.Array:
-            residual_out = cost.compute_residual(*args, **kwargs)  # type: ignore
+        def _residual_no_cache(vals, regular_args, regular_kwargs, aux_data_dict) -> jax.Array:
+            residual_out = cost.compute_residual(vals, regular_args, regular_kwargs, aux_data_dict)
             if isinstance(residual_out, tuple):
                 assert len(residual_out) == 2
                 return residual_out[0]
@@ -863,8 +1003,21 @@ class _AnalyzedCost[*Args](Cost[*Args]):
 
         # Cache the residual dimension for this cost.
         dummy_vals = jax.eval_shape(VarValues.make, variables)
+        dummy_regular_args, dummy_regular_kwargs = cost.args
+        dummy_aux_data = {}
+
+        # Create dummy auxiliary data using auxiliary_spec
+        if cost.auxiliary_keys and auxiliary_spec is not None:
+            for key in cost.auxiliary_keys:
+                if key in auxiliary_spec:
+                    spec = auxiliary_spec[key]
+                    # Create a ShapeDtypeStruct for jax.eval_shape
+                    dummy_aux_data[key] = jax.ShapeDtypeStruct(spec.shape, spec.dtype)
+                else:
+                    raise ValueError(f"Auxiliary key '{key}' not found in auxiliary_spec")
+
         residual_dim = onp.prod(
-            jax.eval_shape(_residual_no_cache, dummy_vals, *cost.args).shape
+            jax.eval_shape(_residual_no_cache, dummy_vals, dummy_regular_args, dummy_regular_kwargs, dummy_aux_data).shape
         )
 
         return _AnalyzedCost(

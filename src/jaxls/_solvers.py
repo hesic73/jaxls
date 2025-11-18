@@ -243,10 +243,11 @@ class NonlinearSolver:
         problem: AnalyzedLeastSquaresProblem,
         initial_vals: VarValues,
         return_summary: jdc.Static[bool] = False,
+        auxiliary_data: dict[str, jax.Array] | None = None,
     ) -> VarValues | tuple[VarValues, SolveSummary]:
         vals = initial_vals
         residual_vector, jac_cache = problem.compute_residual_vector(
-            vals, include_jac_cache=True
+            vals, auxiliary_data=auxiliary_data, include_jac_cache=True
         )
 
         initial_cost = jnp.sum(residual_vector**2)
@@ -285,20 +286,23 @@ class NonlinearSolver:
         )
 
         # Optimization.
-        state = self.step(problem, state, first=True)
+        import functools
+        step_fn = functools.partial(self.step, auxiliary_data=auxiliary_data)
+
+        state = step_fn(problem, state, first=True)
         if self.termination.early_termination:
             state = jax.lax.while_loop(
                 cond_fun=lambda state: jnp.logical_not(
                     jnp.any(state.summary.termination_criteria)
                 ),
-                body_fun=lambda state: self.step(problem, state, first=False),
+                body_fun=lambda state: step_fn(problem, state, first=False),
                 init_val=state,
             )
         else:
             state = jax.lax.fori_loop(
                 1,  # Start from 1 since we already did one step!
                 self.termination.max_iterations,
-                body_fun=lambda step, state: self.step(problem, state, first=False),
+                body_fun=lambda step, state: step_fn(problem, state, first=False),
                 init_val=state,
             )
         if self.verbose:
@@ -322,13 +326,14 @@ class NonlinearSolver:
         problem: AnalyzedLeastSquaresProblem,
         state: _NonlinearSolverState,
         first: bool,
+        auxiliary_data: dict[str, jax.Array] | None = None,
     ) -> _NonlinearSolverState:
         # Log optimizer state for debugging.
         if self.verbose:
             self._log_state(problem, state)
 
         # Get nonzero values of Jacobian.
-        A_blocksparse = problem._compute_jac_values(state.vals, state.jac_cache)
+        A_blocksparse = problem._compute_jac_values(state.vals, state.jac_cache, auxiliary_data)
 
         # Compute Jacobian scaler.
         if first:
@@ -418,7 +423,7 @@ class NonlinearSolver:
             scaled_local_delta, problem.tangent_ordering
         )
         proposed_residual_vector, proposed_jac_cache = problem.compute_residual_vector(
-            proposed_vals, include_jac_cache=True
+            proposed_vals, auxiliary_data=auxiliary_data, include_jac_cache=True
         )
         proposed_cost = jnp.sum(proposed_residual_vector**2)
 
