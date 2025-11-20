@@ -1007,8 +1007,14 @@ class _AnalyzedCost[*Args](Cost[*Args]):
         dummy_aux_data = {}
 
         # Create dummy auxiliary data using auxiliary_spec
-        if cost.auxiliary_keys and auxiliary_spec is not None:
-            for key in cost.auxiliary_keys:
+        if auxiliary_spec is not None:
+            requested_keys = []
+            if cost.auxiliary_keys:
+                requested_keys.extend(cost.auxiliary_keys)
+            if cost.auxiliary_kwarg_keys:
+                requested_keys.extend(cost.auxiliary_kwarg_keys.values())
+
+            for key in requested_keys:
                 if key in auxiliary_spec:
                     spec = auxiliary_spec[key]
                     # Create a ShapeDtypeStruct for jax.eval_shape
